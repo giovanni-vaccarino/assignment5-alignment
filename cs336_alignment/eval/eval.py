@@ -61,33 +61,52 @@ def evaluate_vllm(
     prompts: List[Tuple[str, str]],
     reward_fn: Callable[[str, str], dict[str, float]],
     output_path: str | None = None,
+    batch_size: int | None = 1,
 ) -> dict:
     """
     Evaluate a model on a list of prompts, compute eval metrics and serialize to disk.
+
+    Prompts are sent to vLLM in chunks of `batch_size` (None = all in one call, letting
+    vLLM's continuous batching schedule everything). Results are appended to `output_path`
+    after each chunk, so a crash doesn't lose finished work.
     """
     results = []
+    chunk_size = batch_size or len(prompts)
 
-    # Serialized version (batch size = 1)
-    for prompt, ground_truth in prompts:
-        outputs = vllm_model.generate(prompt, eval_sampling_params, use_tqdm=False)
-        generated_text = outputs[0].outputs[0].text
-        rewards = reward_fn(generated_text, ground_truth)
-        results.append({
-            "prompt": prompt,
-            "response": generated_text,
-            "ground_truth": ground_truth,
-            "rewards": rewards,
-        })
-
-    metrics = summarize(results)
-
+    out_file = None
     if output_path is not None:
         out = Path(output_path)
         out.parent.mkdir(parents=True, exist_ok=True)
-        with open(out, "w") as f:
-            for r in results:
-                f.write(json.dumps(r) + "\n")
-        out.with_suffix(".metrics.json").write_text(json.dumps(metrics, indent=2))
+        out_file = open(out, "w")
+
+    try:
+        for start in range(0, len(prompts), chunk_size):
+            chunk = prompts[start:start + chunk_size]
+            outputs = vllm_model.generate(
+                [prompt for prompt, _ in chunk], eval_sampling_params, use_tqdm=False
+            )
+            # vLLM returns outputs in the same order as the input prompts.
+            for (prompt, ground_truth), output in zip(chunk, outputs):
+                generated_text = output.outputs[0].text
+                result = {
+                    "prompt": prompt,
+                    "response": generated_text,
+                    "ground_truth": ground_truth,
+                    "rewards": reward_fn(generated_text, ground_truth),
+                }
+                results.append(result)
+                if out_file is not None:
+                    out_file.write(json.dumps(result) + "\n")
+            if out_file is not None:
+                out_file.flush()
+            print(f"[{len(results)}/{len(prompts)}] accuracy so far: {summarize(results)['accuracy']:.3f}")
+    finally:
+        if out_file is not None:
+            out_file.close()
+
+    metrics = summarize(results)
+    if output_path is not None:
+        Path(output_path).with_suffix(".metrics.json").write_text(json.dumps(metrics, indent=2))
 
     return metrics
 
@@ -98,6 +117,7 @@ def main(
     output_path: str = "outputs/eval/zero_shot_gsm8k.jsonl",
     limit: int | None = None,
     max_tokens: int = 1024,
+    batch_size: int = 1,  # 0 = all prompts in a single generate call
 ):
     examples = load_gsm8k(data_path, limit=limit)
     prompts = build_prompts(examples, load_prompt_template("r1_zero"))
@@ -119,7 +139,9 @@ def main(
         include_stop_str_in_output=True,
     )
 
-    metrics = evaluate_vllm(llm, sampling_params, prompts, r1_zero_reward_fn, output_path)
+    metrics = evaluate_vllm(
+        llm, sampling_params, prompts, r1_zero_reward_fn, output_path, batch_size=batch_size or None
+    )
     print(json.dumps(metrics, indent=2))
 
 
