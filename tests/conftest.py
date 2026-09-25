@@ -210,7 +210,7 @@ def output_strs():
 
 @pytest.fixture
 def model_id():
-    return "/data/a5-alignment/models/Qwen2.5-Math-1.5B"
+    return "Qwen/Qwen2.5-Math-1.5B"
 
 
 @pytest.fixture
@@ -220,6 +220,12 @@ def tokenizer(model_id):
 
 @pytest.fixture
 def model(model_id):
+    if torch.cuda.is_available():
+        # Snapshots were computed in fp32 (bf16/fp16 miss the 1e-2 tolerance), and fp32 doesn't
+        # fit in a 6GB GPU: put as many layers as fit on the GPU and offload the rest to CPU.
+        return AutoModelForCausalLM.from_pretrained(
+            model_id, device_map="auto", max_memory={0: "4.5GiB", "cpu": "16GiB"}
+        )
     return AutoModelForCausalLM.from_pretrained(model_id)
 
 
