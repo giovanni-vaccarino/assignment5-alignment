@@ -127,7 +127,6 @@ def main(
         gpu_memory_utilization=0.8,
         max_model_len=2048,
         swap_space=0,
-        enforce_eager=True,
     )
 
     sampling_params = SamplingParams(
