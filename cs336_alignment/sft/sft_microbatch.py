@@ -1,4 +1,5 @@
 import torch
+from einops import rearrange
 from cs336_alignment.sft.masked_normalize import masked_normalize
 
 def sft_microbatch_train_step(
@@ -15,6 +16,8 @@ def sft_microbatch_train_step(
         loss
         metadata
     """
+    policy_log_probs = rearrange(policy_log_probs, "... T -> (...) T")
+    response_mask = rearrange(response_mask, "... T -> (...) T")
     loss = - masked_normalize(policy_log_probs, response_mask, normalize_constant) / (gradient_accumulation_steps * policy_log_probs.shape[0])
     loss.backward()
 
