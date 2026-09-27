@@ -23,6 +23,8 @@ Rule: run one solid experiment first, look at it, then decide what to run next. 
 - The shell's default `HF_HOME` (`/work/hdd/bghp/huggingface_cache`) is not readable; the job script overrides it.
 - SLURM: `jobs/sft.slurm` (account `bhag-delta-gpu`, partition `gpuA100x4-interactive`, 2 GPUs, 16 CPU, 64G,
   **1h max**). Logs in `outputs/slurm/`. Interactive is used on purpose: starts in minutes vs days.
+  QOS `gpua100x4intqos`: **max 2 submitted, 1 running per user** -> runs are sequential. `jobs/submit_when_free.sh`
+  (run with setsid nohup) feeds queued runs in as slots free up; log in `outputs/slurm/submitter.log`.
   ```
   sbatch -J <run> jobs/sft.slurm --run-name <run> --attn-implementation flash_attention_2 --n-eval-examples 1319 --seed 0 [...]
   ```
@@ -68,6 +70,10 @@ Git: `.gitignore` tracks only `outputs/**/*.md`, `outputs/sft/*.png` and `output
 | run | final acc | best acc | final format | wall time | notes |
 |---|---|---|---|---|---|
 | **full_lr2e-5** (job 22453531) | **62.7%** | 62.7% | 99.5% | 31.6 min | 701 steps; train 20.8 min, 16 evals 7.6 min |
+| n128 (job 22489052) | 64.2% | 67.1% @50 | 97.5% | 9.2 min | 20 ep, 80 steps; train loss -> 0.000, entropy 0.13 |
+| n256 (job 22489053) | 63.1% | 63.1% @80 | 98.9% | 7.6 min | 10 ep, 80 steps; train loss -> 0.000, entropy 0.14 |
+| n512 (job 22491310) | 58.1% | 58.6% @70 | 96.1% | 8.4 min | 5 ep, 80 steps; train loss 0.08, entropy 0.32 |
+| n1024 (job 22491367) | 55.2% | 56.1% @70 | 97.5% | 10.9 min | 3 ep, 96 steps; train loss 0.25, entropy 0.42 |
 | smoke (job 22453391) | 26.6% (64 ex) | 26.6% | 62.5% | 3.0 min | 4 steps; step 1.8 s, 64-ex eval 8-12 s, startup ~2.3 min |
 | smoke (job 22453139) | FAILED | — | — | 4.5 min | crashed after step-0 eval (acc 3.1%, fmt 25% on 64 ex) |
 
@@ -96,11 +102,29 @@ max_grad_norm=1.0 clip is active on every step -> updates are effectively lr * u
   but remain longer. Long answers are a signal of the model being wrong.
 - Plots: `outputs/sft/phase1_lr_sweep_metrics.png` (acc, format, length correct/incorrect, entropy, loss, grad norm).
 
+### Dataset-size sweep notes (2026-09-27), lr 2e-5, bs 32, ~80 steps each
+- Result is NOT monotonic in data size: n128 64.2% ~ n256 63.1% ~ full 62.7% > n512 58.1% > n1024 55.2%.
+  Accuracy tracks *how much the run memorized / how low its entropy got* more than how many unique examples it saw:
+  n128/n256 (10-20 epochs) drive train loss to ~0 and entropy to ~0.13; n512/n1024 (3-5 epochs) don't.
+- Leading hypothesis: eval samples at **T=1.0**, which rewards a confident (low-entropy) model: it samples almost
+  greedily, so fewer random slips. Memorizing a tiny set sharpens the distribution -> higher T=1 accuracy, not
+  necessarily more knowledge. The full run (entropy 0.35) pays that sampling tax.
+- 128 examples are enough to teach the format (all runs reach 96-99% format within ~20 steps) and to unlock most
+  of what Qwen2.5-Math already knows ("superficial alignment" / LIMA-style).
+- Equal-compute comparison at step ~80: the full run was ~47% while the small runs were 55-64%. Confound: the small runs'
+  cosine schedule has decayed to 0 by step 80 (annealed), while the full run at step 80 is still at peak LR.
+- Mild overfitting only for n128 (peak 67.1% at step 50 -> 64.2% at step 80); entropy starts rising again at the end.
+- Length: wrong answers stay much longer than correct ones in every run (correct ~90 tokens in all runs).
+- Next to disentangle: **greedy (T=0) eval** of the final models (needs --save-model or a configurable eval
+  temperature), and a 2nd seed for n128/n256 (subset variance).
+
 ## TODO / possible experiments
 - [x] Smoke test (128 ex, 1 epoch, 64 eval)
 - [x] First solid run: `full_lr2e-5` -> 62.7% final
-- [ ] Rest of Phase 1: lr 1e-5, 5e-5, bs64
-- [ ] Phase 2 dataset-size sweep
+- [~] Rest of Phase 1: lr 1e-5, 5e-5, bs64 -- skipped by choice (15% target already met; not needed for interview prep)
+- [x] Dataset-size sweep n128/n256/n512/n1024 (+ full) -> see notes
+- [ ] 2nd seed for n128/n256 (which 128 examples matters)
+- [ ] Wrong-answer ablation: corrupt final answers in 0/25/50% of SFT targets (needs a data-loader flag)
 - [ ] Greedy (T=0) eval of the final checkpoint, to separate "learned the task" from sampling noise
 - [ ] Filtered SFT / expert iteration (A5 §4.4 / §5): keep only correct model-generated traces
 - [ ] Look at failure modes in `outputs/sft/<run>/eval/step_*.jsonl`: format errors vs wrong answers, length
