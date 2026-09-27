@@ -118,17 +118,48 @@ max_grad_norm=1.0 clip is active on every step -> updates are effectively lr * u
 - Next to disentangle: **greedy (T=0) eval** of the final models (needs --save-model or a configurable eval
   temperature), and a 2nd seed for n128/n256 (subset variance).
 
+## Main takeaways (dataset-size sweep + full run)
+
+1. **SFT mostly teaches the format.** Zero-shot is 3% accuracy / 17% format; every run reaches 96-99% format
+   within ~10-20 steps. Qwen2.5-Math already has most of the ability; SFT teaches it to expose it in the graded format.
+2. **128 examples is enough.** n128 (64.2%) ~ n256 (63.1%) ~ full 7473 (62.7%), within T=1 noise. A 58x smaller dataset
+   and ~3.5x less wall time give the same final accuracy. Diminishing returns in data size are extreme here.
+3. **Accuracy is not monotonic in data size**: n512 58.1%, n1024 55.2% are *worse* than n128. Unique examples
+   are not what separates the runs. The epoch count is: 10-20 epochs (n128/n256) vs 3-5 (n512/n1024).
+4. **Memorization drives entropy down, which a T=1 eval rewards.** Train loss/token -> 0.000 and token entropy
+   -> 0.13 for n128/n256, vs 0.25 / 0.42 for n1024. A confident model samples near-greedily and slips less at T=1.
+   So the ranking mixes "what the model knows" with "how peaked its distribution is". Without a greedy eval we can't
+   separate them. The honest conclusion: *under T=1 sampling*, small + many epochs is as good as full data.
+5. **Memorizing != catastrophic overfitting here.** n128 hits zero train loss yet keeps 64% test accuracy. Only a mild
+   late decline (67.1% peak at step 50 -> 64.2%). It memorized solution *style*, not just answers.
+6. **The eval is noisy, so measure noise before ranking.** Near-identical weights (full run, steps 700 vs 701) differ by
+   2.7 pts. Per problem, n128 and the full run disagree a lot: 639 solved by both, 208 only by n128, 188 only by full.
+7. **There is large headroom beyond any single model.** Of 1319 test problems, 1165 (88%) are solved by *at least one* of the
+   5 final models, only 355 (27%) by *all* of them, while each individual model gets 55-64%. The models "can" solve far
+   more than they reliably do: high pass@k, lower pass@1. This is exactly the gap RL (expert iteration / GRPO) exploits,
+   by sharpening the policy toward answers it already sometimes produces.
+8. **Error profile.** Final wrong answers are almost all *well-formatted but wrong* (439-558 per run) vs 6-52 unformatted.
+   The remaining errors are reasoning/arithmetic, not format. Wrong answers are consistently longer than correct ones
+   (~120-200 vs ~90 tokens): length is a cheap signal of failure.
+9. **Loss curves show epochs clearly.** In multi-epoch training the train loss drops in steps at each epoch boundary
+   (the model re-sees examples). Eval jumps at the same points in the full run, so the repetition still helped there.
+10. **Caveats.** One seed (one random subset per size). Cosine schedule is per-run, so at equal steps the small runs are
+    fully annealed while the full run is at peak LR. T=1 eval only. GSM8K references are human-written and all
+    correct, unlike the assignment's R1 traces on MATH.
+
 ## TODO / possible experiments
+Legend: [x] done, [~] skipped by choice, [-] not planned.
 - [x] Smoke test (128 ex, 1 epoch, 64 eval)
 - [x] First solid run: `full_lr2e-5` -> 62.7% final
 - [~] Rest of Phase 1: lr 1e-5, 5e-5, bs64 -- skipped by choice (15% target already met; not needed for interview prep)
 - [x] Dataset-size sweep n128/n256/n512/n1024 (+ full) -> see notes
-- [ ] 2nd seed for n128/n256 (which 128 examples matters)
-- [ ] Wrong-answer ablation: corrupt final answers in 0/25/50% of SFT targets (needs a data-loader flag)
-- [ ] Greedy (T=0) eval of the final checkpoint, to separate "learned the task" from sampling noise
-- [ ] Filtered SFT / expert iteration (A5 §4.4 / §5): keep only correct model-generated traces
-- [ ] Look at failure modes in `outputs/sft/<run>/eval/step_*.jsonl`: format errors vs wrong answers, length
+- [-] 2nd seed for n128/n256 (which 128 examples matters) -- not planned
+- [-] Wrong-answer ablation: corrupt final answers in 0/25/50% of SFT targets (needs a data-loader flag) -- not planned
+- [-] Greedy (T=0) eval of the final checkpoint, to separate "learned the task" from sampling noise -- not planned
+- [-] Filtered SFT (A5 §4.3 part 2) -- not planned: GSM8K references are all correct, filtering removes nothing
+- [-] Expert iteration (A5 §5) -- not planned (it would still be meaningful: it trains on the model's *own* correct traces, but GRPO covers the same idea better)
+- [-] Look at failure modes in `outputs/sft/<run>/eval/step_*.jsonl`: format errors vs wrong answers, length
 - [x] Entropy / length / loss / grad-norm plots (`*_metrics.png` from plot_sft_sweep.py)
-- [ ] Pure bf16 (`--param-dtype bfloat16`) vs fp32 master weights: speed, memory, accuracy
-- [ ] Microbatch size / gradient checkpointing throughput tradeoff
-- [ ] GRPO on top of the SFT checkpoint (A5 §7)
+- [-] Pure bf16 (`--param-dtype bfloat16`) vs fp32 master weights: speed, memory, accuracy
+- [-] Microbatch size / gradient checkpointing throughput tradeoff
+- [ ] GRPO on top of the SFT checkpoint (A5 §7) -- possible next direction
