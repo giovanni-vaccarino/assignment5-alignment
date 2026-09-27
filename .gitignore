@@ -165,3 +165,11 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# Experiment outputs: track only key result plots and markdown, not raw logs / jsonl / json
+outputs/**
+!outputs/**/
+!outputs/**/*.md
+!outputs/sft/*.png
+!outputs/sft/*/plots/*.png
+outputs/sft/smoke*/

@@ -120,11 +120,14 @@ def main(
             llm, eval_sampling_params, val_pairs, r1_zero_reward_fn,
             output_path=str(run_dir / "eval" / f"step_{step:05d}.jsonl"), batch_size=None,
         )
-        gen = log_generations(
-            llm, policy, tokenizer, val_prompts[:n_log_generations], val_gts[:n_log_generations],
-            r1_zero_reward_fn, eval_sampling_params,
-            output_path=str(run_dir / "generations.jsonl"), step=step,
-        )
+        # The entropy forward inside log_generations needs the same bf16 autocast as training
+        # (flash_attention_2 rejects fp32 activations).
+        with autocast:
+            gen = log_generations(
+                llm, policy, tokenizer, val_prompts[:n_log_generations], val_gts[:n_log_generations],
+                r1_zero_reward_fn, eval_sampling_params,
+                output_path=str(run_dir / "generations.jsonl"), step=step,
+            )
         logger.log("eval", step, {
             "accuracy": metrics["accuracy"],
             "format_rate": metrics["format_rate"],
