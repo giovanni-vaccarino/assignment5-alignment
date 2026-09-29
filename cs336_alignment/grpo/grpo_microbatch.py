@@ -27,7 +27,7 @@ def grpo_microbatch_train_step(
     )
 
     # 2. Aggregate loss and call backward
-    loss = masked_mean(per_token_loss, response_mask, dim=None) / gradient_accumulation_steps
+    loss = masked_mean(per_token_loss, response_mask, dim=-1).mean() / gradient_accumulation_steps
     loss.backward()
 
     return loss, metadata
