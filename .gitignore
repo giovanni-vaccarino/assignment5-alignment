@@ -172,4 +172,7 @@ outputs/**
 !outputs/**/*.md
 !outputs/sft/*.png
 !outputs/sft/*/plots/*.png
+!outputs/grpo/*.png
+!outputs/grpo/*/plots/*.png
 outputs/sft/smoke*/
+outputs/grpo/smoke*/
