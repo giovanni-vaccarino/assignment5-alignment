@@ -60,6 +60,34 @@ Options: (A) shorter runs (~60-90 steps) compared at equal steps; (B) add checkp
 
 | run | steps | final val acc | best val acc | final format | wall time | notes |
 |---|---|---|---|---|---|---|
+| grpo_base (job 22550804) | 1 | FAILED (OOM) | — | — | 3.8 min | CUDA OOM on policy GPU in step-2 forward; step 0 eval 3.1% / fmt 25.9% |
+
+**OOM on 40 GB A100 (2026-09-29, job 22550804).** Handout defaults assume 80 GB H100s. Step 1 ran
+(rollouts 8.8 s + train 18.7 s = 28 s/step), then step 2's forward OOMed: fp32 weights + grads + AdamW state ≈ 24 GB
+(Adam state appears after the first optimizer.step, hence step 2), plus microbatch-2 activations with responses up to
+~1300 tokens and a 151k-vocab logits tensor (the failed 946 MB alloc). 2.9 GB was reserved-but-unallocated
+(fragmentation). Fix, no logic change: `--gradient-checkpointing` + `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+in `jobs/grpo.slurm`. Rerun = job 22574790. Early signal before the crash: rollout reward 1.6% -> 5.1% at step 2,
+zero-std groups 88% -> 66% (most groups of 8 are all-wrong at the start -> no gradient from them).
+
+### Memory breakdown at the OOM (policy GPU, 40 GB A100)
+Reconstructed from the config (1.544B params, 28 layers, hidden 1536, MLP 8960, vocab 151,936) and the OOM message
+(35.4 GiB allocated + 2.9 GiB reserved-unused, 38.9 GiB used). The failed 946 MiB alloc = one fp32 (2, 816, 151936)
+logits-sized tensor -> the crashing microbatch was ~816 tokens.
+
+| component | GiB | share |
+|---|---|---|
+| fp32 weights (1.544B x 4 B) | 5.75 | 15% |
+| fp32 grads, live during accumulation | 5.75 | 15% |
+| AdamW m + v (x 8 B), allocated at the first optimizer.step -> why step 1 ran and step 2 OOMed | 11.5 | 30% |
+| autocast bf16 weight copies, held until backward | 2.9 | 7% |
+| layer activations (~3 MB/token x 1632 tokens) -> what gradient checkpointing removes | ~4.6 | 12% |
+| logits + logsumexp/entropy fp32 temporaries (~0.93 GiB each, 4-5 of them) -> NOT helped by checkpointing | ~4.5 | 12% |
+| fragmentation | 2.9 | 8% |
+| CUDA context | 0.5 | 1% |
+
+With checkpointing + expandable_segments: ~31-33 GiB worst case (T~1200 microbatch). Bigger levers if ever needed:
+bf16 params/optimizer (-11.5 GiB), 8-bit Adam (-8.6 GiB), entropy on a subsample / chunked log-softmax.
 
 ## Takeaways
 
@@ -67,5 +95,6 @@ _(filled in as runs finish)_
 
 ## TODO
 Legend: [x] done, [~] skipped by choice, [-] not planned.
-- [ ] Agree on the plan
-- [ ] Smoke test (3 GRPO steps, 64 eval examples): check it runs, memory, measured s/step
+- [x] Agree on the plan: base run first (user, 2026-09-29), no checkpoint/resume; ablations decided after
+- [~] Separate smoke test -- skipped by choice, went straight to the base run
+- [ ] grpo_base with gradient checkpointing (job 22574790)

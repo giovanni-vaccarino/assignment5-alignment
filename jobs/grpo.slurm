@@ -18,6 +18,8 @@ cd "$SLURM_SUBMIT_DIR"
 export HF_HOME=/projects/bhag/gvaccarino/hf_cache
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false PYTHONUNBUFFERED=1
+# Reduce fragmentation OOMs on 40 GB A100s (grpo_base 22550804 OOMed with 2.9 GB reserved-but-unallocated)
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 echo "host=$(hostname) job=$SLURM_JOB_ID start=$(date)"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv
