@@ -50,7 +50,7 @@ Options: (A) shorter runs (~60-90 steps) compared at equal steps; (B) add checkp
 | grpo_baselines | no_baseline vs reinforce_with_baseline | 2 H100 h | _pending_ |
 | think_about_length_normalization | masked_mean vs masked_normalize (written answer) | — | _pending_ |
 | grpo_length_normalization | same, empirically | 2 H100 h | _pending_ (needs a CLI flag) |
-| grpo_group_standard_deviation | std normalization on/off (Dr. GRPO) | 2 H100 h | **running**: `grpo_no_std` (job 22576274) |
+| grpo_group_standard_deviation | std normalization on/off (Dr. GRPO) | 2 H100 h | ran `grpo_no_std`: **collapsed** (1 seed) |
 | grpo_off_policy(_sweep) | several gradient steps per rollout batch + GRPO-Clip | 12 H100 h | _pending_ |
 | grpo_off_policy_clip_ablation | GRPO-Clip vs no clip, off-policy | 2 H100 h | _pending_ (needs a new loss type) |
 | grpo_prompt_ablation | r1_zero vs question_only prompt | 2 H100 h | _pending_ |
@@ -60,6 +60,7 @@ Options: (A) shorter runs (~60-90 steps) compared at equal steps; (B) add checkp
 
 | run | steps | final val acc | best val acc | final format | wall time | notes |
 |---|---|---|---|---|---|---|
+| grpo_no_std (job 22576274) | 61 (OOM) | 4.2% (step 60) | **61.1% @30** | 6.4% | 52 min | `--no-use-std-normalization`; collapsed after step ~31 (format drift -> 1024-token garbage), then OOM |
 | **grpo_base** (job 22574790) | 109 (cut by 1 h limit) | **72.7%** (step 100) | 72.7% | 99.9% | 60 min (53 min to last eval) | handout defaults + gradient checkpointing; 959 correct / 359 fmt-wrong / 1 unfmt |
 | grpo_base (job 22550804) | 1 | FAILED (OOM) | — | — | 3.8 min | CUDA OOM on policy GPU in step-2 forward; step 0 eval 3.1% / fmt 25.9% |
 
@@ -89,6 +90,63 @@ logits-sized tensor -> the crashing microbatch was ~816 tokens.
 
 With checkpointing + expandable_segments: ~31-33 GiB worst case (T~1200 microbatch). Bigger levers if ever needed:
 bf16 params/optimizer (-11.5 GiB), 8-bit Adam (-8.6 GiB), entropy on a subsample / chunked log-softmax.
+
+### grpo_no_std (2026-09-30): std normalization off -> training collapse (single seed)
+Eval: 3.1% (0) -> 45.0 (10) -> 56.3 (20) -> **61.1 (30)** -> 45.5 (40) -> **3.6 (50)** -> 4.2 (60); format 93% (10)
+-> 97.6 (20) -> 93.4 (30) -> 65.4 (40) -> 4.9 (50). Plots: `outputs/grpo/std_ablation_{eval_reward,metrics}.png`.
+
+- **Steps 0-30: same as base, slightly slower** (61.1% vs 64.9% at step 30). Pre-clip grad norm stayed lower
+  (~1-3 vs ~5-9 for base), as hypothesized: advantages in [-1, 1] without the 1/std blow-up.
+- **Steps ~31-50: two-stage collapse.** vLLM stops at `</answer>` OR at EOS (`<|endoftext|>`), so a missing tag
+  does NOT by itself force a 1024-token runaway (corrected 2026-09-30; my first write-up claimed it did).
+  Eval answers not ending in `</answer>` -> (ran to ~1024 / stopped via EOS):
+  step 30: 72 (4 / 68) · step 40: 366 (59 / 307, median ~180 tok) · step 50: 982 (502 / 480, median ~570 tok) ·
+  step 60: 1069 (587 / 482). (Base model at step 0 for reference: 523 (45 / 478).)
+  - *Stage 1 (steps ~31-40), format slip:* correct reasoning, ends `</think> $18` + EOS, short. Reward 0 -> eval
+    61% -> 45% with no runaway yet.
+  - *Stage 2 (steps ~40-50), losing the ability to stop:* as entropy climbs, EOS stops being emitted reliably ->
+    ~half the untagged answers hit max_tokens=1024 and the rest get long too (loops like `</think> First, let's...`,
+    then near-random text). Train token entropy 0.2 -> **6.6** (uniform over vocab = 11.9), rollout length
+    150 -> ~700, reward -> 2%, all-wrong groups -> ~90% (no signal left to recover), seconds/step 30 -> 58.
+- **Crash:** OOM at step ~61 on a 1.93 GiB fp32 logits alloc (microbatch of 2 x ~1700 re-tokenized garbage tokens);
+  a symptom of the collapse, not a separate bug. Fragmentation was no longer an issue (113 MiB reserved-unused).
+- **Why it self-reinforces (mechanism, fairly confident):** long zero-reward garbage gets a negative advantage; with
+  masked_mean each token's weight is A/len, so a 1024-token response is penalized only weakly per token, and pushing
+  down sampled tokens spreads probability mass to other tokens -> entropy goes *up* (the opposite of the collapse in
+  grpo_base). More entropy -> more garbage (and fewer EOS) -> more long negative samples. This explains stage 2;
+  it only kicks in once responses are already failing and getting long. Stage 1's trigger is unexplained.
+- **Trigger analysis (2026-09-30).** Ruled out: (a) the stop string (vLLM also stops at EOS); (b) a length bias on
+  shared tokens (with masked_mean, weight = A/len; if wrong answers were *shorter* the shared `<answer>` token would
+  get a net push down, but wrong answers were *longer* in both runs, e.g. 191 vs 136 tokens at step 31). Untagged eval
+  answers: base 3.6% (10) -> 0.7 (20) -> **0.1 (30)**; no_std 6.0 -> 1.4 -> **3.9 (30)** -> 27.6 (40). So in no_std the
+  pressure against slips stalled after step 20. Best-supported explanation: rare slips sit in nearly-solved groups
+  (7/8 correct); with std norm each non-degenerate group gets ~equal weight (total |A| ∝ sqrt(p(1-p))), without it
+  weight ∝ p(1-p), so a 7/8 group counts ~1.5x less relative to a 50/50 group -> the "fix the rare slip on an easy
+  question" signal is down-weighted (the flip side of Dr. GRPO's difficulty-bias fix). This explains *not
+  suppressing* slips, not their *growth* 4% -> 28% in 10 steps; concurrently no_std's correct answers were getting
+  longer (116 -> 162 tok by step 28 vs base ~105-114) and entropy started rising ~step 25-34, but order is unclear.
+- **Is it caused by removing std normalization?** Not established. One seed per
+  config; identical rollouts at step 1, then chaotic divergence. It could be std-norm-specific or seed luck.
+  To attribute it: rerun `grpo_no_std` (and/or `grpo_base`) with `--seed 1`.
+- **Early warning:** train-side entropy (0.27 -> 2.5) and rollout length (150 -> 250) jumped at step ~33-34, while
+  the step-30 eval still looked fine (61%). Entropy and length are the metrics to alert on; eval every 10 steps lagged.
+
+### Entropy collapse: why, is it a problem, fixes (discussion, 2026-09-30)
+- **Why.** For softmax policies, the entropy change per update is ~ -Cov(log pi(token), advantage) (Cui et al. 2025,
+  "The Entropy Mechanism of RL for Reasoning LMs"). Likely tokens are more often correct -> positive covariance ->
+  entropy falls (rich-get-richer). Nothing pushes back: 0/1 outcome reward, no KL, no entropy term; negative
+  advantages (which spread mass) become rare once reward is ~80%. Reward-irrelevant wording locks into one template
+  (steps 50 and 100 rollouts are near word-for-word identical).
+- **Is it a problem?** Not for pass@1 so far (accuracy kept rising). But: (1) exploration dies -> 8 identical
+  samples = zero-std group = no gradient, and always-wrong questions never produce a correct sample to learn from;
+  entropy < 0.1, zero-std groups ~67% and the accuracy plateau all coincide around steps 50-80 (consistent, not
+  proven); (2) pass@k at large k can drop below the base model (Yue et al. 2025); (3) confident errors / worse
+  calibration; (4) less diversity left for further RL.
+- **Fixes:** clip-higher (DAPO; off-policy only), dynamic sampling / harder data (DAPO), entropy bonus (better:
+  adaptive to a target entropy), Clip-Cov / KL-Cov (Cui et al.), update only high-entropy forking tokens (Wang et al.
+  2025), up-weight negative samples (Zhu et al. 2025), KL to reference (slows learning too), higher rollout
+  temperature / larger G. Modern recipes treat entropy as the main health metric.
+- **Possible test (not planned yet):** pass@k (k=8/16) of base vs step-100 model; needs --save-model + small eval code.
 
 ## Takeaways
 
@@ -141,6 +199,11 @@ Legend: [x] done, [~] skipped by choice, [-] not planned.
 - [x] Agree on the plan: base run first (user, 2026-09-29), no checkpoint/resume; ablations decided after
 - [~] Separate smoke test -- skipped by choice, went straight to the base run
 - [x] grpo_base with gradient checkpointing (job 22574790) -> 72.7% at step 100
-- [ ] grpo_no_std: same as grpo_base + `--no-use-std-normalization` (job 22576274). Hypothesis from grpo_base
+- [x] grpo_no_std: same as grpo_base + `--no-use-std-normalization` (job 22576274) -> peaked 61.1% @30, collapsed to ~4%, OOM at step 61.
+- [ ] grpo_no_std_seed1 (job 22584780): same as grpo_no_std but `--seed 1`, to test whether the collapse is caused by
+  removing std normalization or was seed luck. First run with the new `--log-rollouts` (default on): every training
+  rollout (prompt, response, ground truth, reward, advantage, length) -> `outputs/grpo/<run>/rollouts.jsonl`, so the
+  first untagged answers during training and the advantages they got can be traced step by step.
+  Note: seed 1 also changes the question order and the eval sampling seed, so its step-0 eval differs slightly. Hypothesis from grpo_base
   takeaway 5: advantages become r - mean(r) in [-1, 1] (no 1/std blow-up for 7/8 or 1/8 groups), so the pre-clip
   grad norm should grow much less; effect on accuracy unclear (Dr. GRPO reports similar or better).

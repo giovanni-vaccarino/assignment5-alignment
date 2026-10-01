@@ -7,6 +7,7 @@ Layout (same as SFT): policy (HF, trained) on `policy_device`, vLLM on `vllm_dev
 vLLM generates both the training rollouts and the eval samples; policy weights are copied into it
 at the start of every GRPO step (so rollouts come from pi_theta_old = current policy).
 """
+import json
 import random
 import time
 from contextlib import nullcontext
@@ -114,6 +115,7 @@ def main(
     n_eval_examples: int | None = 1024,         # handout: >= 1024 to compare hyperparameters
     n_log_generations: int = 16,
     save_model: bool = False,
+    log_rollouts: bool = True,                  # write every training rollout to <run_dir>/rollouts.jsonl
 ):
     config = dict(locals())
     run_dir = Path(output_dir) / run_name
@@ -271,6 +273,14 @@ def main(
             "response_length_incorrect": response_lengths[~correct].mean().item() if (~correct).any() else None,
             "rollout_time_s": rollout_time,
         })
+        if log_rollouts:  # every training rollout, to trace failure modes step by step (~0.2-1 MB/step)
+            with open(run_dir / "rollouts.jsonl", "a") as f:
+                for i, (prompt, response, gt) in enumerate(zip(repeated_prompts, responses, repeated_gts)):
+                    f.write(json.dumps({
+                        "grpo_step": grpo_step, "group": i // group_size, "prompt": prompt, "response": response,
+                        "ground_truth": gt, "reward": raw_rewards[i].item(), "advantage": advantages[i].item(),
+                        "response_length": int(response_lengths[i]),
+                    }) + "\n")
 
         # 4. Old log-probs (grpo_clip only): once per rollout batch, before any update, no gradient
         if loss_type == "grpo_clip":
