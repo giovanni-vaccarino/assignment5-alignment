@@ -50,7 +50,7 @@ Options: (A) shorter runs (~60-90 steps) compared at equal steps; (B) add checkp
 | grpo_baselines | no_baseline vs reinforce_with_baseline | 2 H100 h | _pending_ |
 | think_about_length_normalization | masked_mean vs masked_normalize (written answer) | — | _pending_ |
 | grpo_length_normalization | same, empirically | 2 H100 h | _pending_ (needs a CLI flag) |
-| grpo_group_standard_deviation | std normalization on/off (Dr. GRPO) | 2 H100 h | ran `grpo_no_std`: **collapsed** (1 seed) |
+| grpo_group_standard_deviation | std normalization on/off (Dr. GRPO) | 2 H100 h | ran 2 seeds: seed 0 **collapsed**, seed 1 stable at 75.3% (both show a drift episode at steps ~21-35) |
 | grpo_off_policy(_sweep) | several gradient steps per rollout batch + GRPO-Clip | 12 H100 h | _pending_ |
 | grpo_off_policy_clip_ablation | GRPO-Clip vs no clip, off-policy | 2 H100 h | _pending_ (needs a new loss type) |
 | grpo_prompt_ablation | r1_zero vs question_only prompt | 2 H100 h | _pending_ |
@@ -60,6 +60,7 @@ Options: (A) shorter runs (~60-90 steps) compared at equal steps; (B) add checkp
 
 | run | steps | final val acc | best val acc | final format | wall time | notes |
 |---|---|---|---|---|---|---|
+| **grpo_no_std_seed1** (job 22584780) | 95 (cut by 1 h limit) | **75.3%** (step 90) | 75.3% | 99.5% | 60 min | no std norm, seed 1; stable, but a near-miss at steps ~21-35 (see notes); first run with rollouts.jsonl |
 | grpo_no_std (job 22576274) | 61 (OOM) | 4.2% (step 60) | **61.1% @30** | 6.4% | 52 min | `--no-use-std-normalization`; collapsed after step ~31 (format drift -> 1024-token garbage), then OOM |
 | **grpo_base** (job 22574790) | 109 (cut by 1 h limit) | **72.7%** (step 100) | 72.7% | 99.9% | 60 min (53 min to last eval) | handout defaults + gradient checkpointing; 959 correct / 359 fmt-wrong / 1 unfmt |
 | grpo_base (job 22550804) | 1 | FAILED (OOM) | — | — | 3.8 min | CUDA OOM on policy GPU in step-2 forward; step 0 eval 3.1% / fmt 25.9% |
@@ -131,6 +132,39 @@ Eval: 3.1% (0) -> 45.0 (10) -> 56.3 (20) -> **61.1 (30)** -> 45.5 (40) -> **3.6 
 - **Early warning:** train-side entropy (0.27 -> 2.5) and rollout length (150 -> 250) jumped at step ~33-34, while
   the step-30 eval still looked fine (61%). Entropy and length are the metrics to alert on; eval every 10 steps lagged.
 
+### grpo_no_std_seed1 (2026-10-01): no std norm, seed 1 -> stable, 75.3%, but the same drift episode
+Eval: 2.9% (0) -> 43.9 (10) -> 55.8 (20) -> 63.4 (30) -> 69.5 (40) -> 72.3 (50) -> 72.6 (60) -> 74.6 (70) -> 75.0 (80)
+-> **75.3 (90)**. Plots (3 runs overlaid): `outputs/grpo/std_ablation_{eval_reward,metrics}.png`.
+
+| steps | run | train reward | zero-std groups | length (correct / wrong) | token entropy | grad norm |
+|---|---|---|---|---|---|---|
+| 21-35 | base | 0.73 | 0.47 | 114 / 153 | 0.14 | 6.3 |
+| 21-35 | no_std seed 0 | 0.70 | 0.43 | 145 / 232 | 0.69 | 4.4 |
+| 21-35 | no_std seed 1 | **0.54** | 0.18 | 140 / 311 | **0.77** | 7.2 |
+| 51-80 | base | 0.82 | 0.66 | 115 / 175 | 0.08 | 33.5 |
+| 51-80 | no_std seed 1 | 0.68 | 0.35 | 138 / 227 | 0.41 | 22.7 |
+| 81-95 | base | 0.82 | 0.64 | 109 / 151 | 0.05 | 54.0 |
+| 81-95 | no_std seed 1 | 0.78 | 0.58 | 153 / 299 | 0.13 | 12.1 |
+
+- **The collapse was neither pure luck nor inevitable.** Seed 1 went through the *same* episode at steps ~21-35 and
+  recovered. From `rollouts.jsonl` (training rollouts): untagged answers 4.1% (steps 11-20) -> **13.2% (21-30)** ->
+  6.5% (31-40) -> 1.7% (41-60); train reward dipped to ~0.54, entropy spiked to ~1.6 around step 25, wrong answers got
+  long (311 tok). Seed 0 had the same drift starting ~step 31 and did not recover. Base (seed 0) never showed it
+  (untagged -> 0.1%, entropy ~0.14 throughout). So 2/2 no_std seeds show a fragile phase; base 0/1. Suggestive, not
+  proof: there is no base seed-1 run for a matched pair.
+- **My "nearly-solved groups are down-weighted" explanation is NOT supported by the rollout log.** Untagged answers
+  in steps 21-30 were spread over all group types (correct-per-group k=0..7: 43, 76, 42, 56, 34, 54, 25, 9), not
+  concentrated in 7/8 groups, and they did receive negative advantages (mean -0.35 to -0.46). The trigger of the
+  drift is still not identified. What is reproducible is the signature: entropy and wrong-answer length rise
+  together with untagged answers.
+- **Stable-state differences vs base (different seeds, so +-2-3 pts of noise):** accuracy 75.3% vs 72.2% at step 90;
+  entropy stays higher for longer (0.41 vs 0.08 at steps 51-80; 0.13 vs 0.05 at the end) -> less entropy collapse;
+  fewer zero-std groups (0.35 vs 0.66 at steps 51-80) -> more questions still give gradient; answers longer (correct
+  ~140-150 vs ~110-115 tokens); pre-clip grad norm lower (12 vs 54 at the end), as predicted.
+- **Net:** removing std normalization here looks like a trade: more exploration / less collapse and equal-or-better
+  accuracy, but a less stable phase around steps 20-35 that can be fatal (1 of 2 seeds).
+- Rollout logging works: 24,320 rows (95 steps x 256), 33 MB.
+
 ### Entropy collapse: why, is it a problem, fixes (discussion, 2026-09-30)
 - **Why.** For softmax policies, the entropy change per update is ~ -Cov(log pi(token), advantage) (Cui et al. 2025,
   "The Entropy Mechanism of RL for Reasoning LMs"). Likely tokens are more often correct -> positive covariance ->
@@ -200,10 +234,6 @@ Legend: [x] done, [~] skipped by choice, [-] not planned.
 - [~] Separate smoke test -- skipped by choice, went straight to the base run
 - [x] grpo_base with gradient checkpointing (job 22574790) -> 72.7% at step 100
 - [x] grpo_no_std: same as grpo_base + `--no-use-std-normalization` (job 22576274) -> peaked 61.1% @30, collapsed to ~4%, OOM at step 61.
-- [ ] grpo_no_std_seed1 (job 22584780): same as grpo_no_std but `--seed 1`, to test whether the collapse is caused by
-  removing std normalization or was seed luck. First run with the new `--log-rollouts` (default on): every training
-  rollout (prompt, response, ground truth, reward, advantage, length) -> `outputs/grpo/<run>/rollouts.jsonl`, so the
-  first untagged answers during training and the advantages they got can be traced step by step.
-  Note: seed 1 also changes the question order and the eval sampling seed, so its step-0 eval differs slightly. Hypothesis from grpo_base
+- [x] grpo_no_std_seed1 (job 22584780), `--seed 1` + rollout logging -> stable, 75.3% at step 90; near-miss at steps ~21-35.
   takeaway 5: advantages become r - mean(r) in [-1, 1] (no 1/std blow-up for 7/8 or 1/8 groups), so the pre-clip
   grad norm should grow much less; effect on accuracy unclear (Dr. GRPO reports similar or better).
