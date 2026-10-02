@@ -27,7 +27,8 @@ One optimizer step per rollout batch -> exactly on-policy.
 ### Environment (NCSA Delta): same as SFT
 - venv `.venv` -> `/work/nvme/bhag/gvaccarino/a5/venv` (never `/work/hdd`). `HF_HOME` overridden in the job script.
 - SLURM: `jobs/grpo.slurm` (account `bhag-delta-gpu`, `gpuA100x4-interactive`, 2 GPUs, 16 CPU, 64G, **1 h max**;
-  QOS: 2 submitted / 1 running per user). Logs in `outputs/slurm/`, runs in `outputs/grpo/<run>/`.
+  QOS: 2 submitted / 1 running per user; **changed to 1 submitted / 1 running by 2026-10-01** -> use
+  `jobs/submit_grpo_when_free.sh <run> [flags]` detached (setsid nohup) to queue the next run; log `outputs/slurm/submitter.log`). Logs in `outputs/slurm/`, runs in `outputs/grpo/<run>/`.
   ```
   sbatch -J <run> jobs/grpo.slurm --run-name <run> [flags...]
   ```
@@ -47,19 +48,22 @@ Options: (A) shorter runs (~60-90 steps) compared at equal steps; (B) add checkp
 |---|---|---|---|
 | grpo_train_loop | loop works, val reward rises, rollouts over time | — | _pending_ |
 | grpo_learning_rate | lr sweep, >= 25% val | 6 H100 h | _pending_ |
-| grpo_baselines | no_baseline vs reinforce_with_baseline | 2 H100 h | _pending_ |
+| grpo_baselines | no_baseline vs reinforce_with_baseline | 2 H100 h | ran `grpo_no_baseline`: 45% vs 72.7% with baseline |
 | think_about_length_normalization | masked_mean vs masked_normalize (written answer) | — | _pending_ |
 | grpo_length_normalization | same, empirically | 2 H100 h | _pending_ (needs a CLI flag) |
 | grpo_group_standard_deviation | std normalization on/off (Dr. GRPO) | 2 H100 h | ran 2 seeds: seed 0 **collapsed**, seed 1 stable at 75.3% (both show a drift episode at steps ~21-35) |
 | grpo_off_policy(_sweep) | several gradient steps per rollout batch + GRPO-Clip | 12 H100 h | _pending_ |
 | grpo_off_policy_clip_ablation | GRPO-Clip vs no clip, off-policy | 2 H100 h | _pending_ (needs a new loss type) |
-| grpo_prompt_ablation | r1_zero vs question_only prompt | 2 H100 h | _pending_ |
+| grpo_prompt_ablation | r1_zero vs question_only prompt | 2 H100 h | ran `grpo_question_only` (x2): 58% zero-shot -> 84% |
 | leaderboard | best MATH score in 4 h | 16 H100 h | skip |
 
 ## Results
 
 | run | steps | final val acc | best val acc | final format | wall time | notes |
 |---|---|---|---|---|---|---|
+| **grpo_question_only** (job 22601289) | 74 (cut by 1 h limit) | **84.2%** (step 70) | 84.3% @60 | 98.9% | 60 min | `--prompt-name question_only`; zero-shot (step 0) already 58.0% |
+| grpo_question_only_rerun (job 22607113) | 78 (cut by 1 h limit) | 83.9% (step 70) | 83.9% | 99.1% | 60 min | accidental same-seed duplicate (my error); useful as a nondeterminism check |
+| grpo_no_baseline (job 22597253) | 119 (cut by 1 h limit) | 45.4% (step 110) | 52.1% @100 | 98.8% | 60 min | `--loss-type no_baseline`; plateaus ~45%, answers shrink to ~40 tokens; 599 correct / 704 fmt-wrong / 16 unfmt |
 | **grpo_no_std_seed1** (job 22584780) | 95 (cut by 1 h limit) | **75.3%** (step 90) | 75.3% | 99.5% | 60 min | no std norm, seed 1; stable, but a near-miss at steps ~21-35 (see notes); first run with rollouts.jsonl |
 | grpo_no_std (job 22576274) | 61 (OOM) | 4.2% (step 60) | **61.1% @30** | 6.4% | 52 min | `--no-use-std-normalization`; collapsed after step ~31 (format drift -> 1024-token garbage), then OOM |
 | **grpo_base** (job 22574790) | 109 (cut by 1 h limit) | **72.7%** (step 100) | 72.7% | 99.9% | 60 min (53 min to last eval) | handout defaults + gradient checkpointing; 959 correct / 359 fmt-wrong / 1 unfmt |
@@ -165,6 +169,83 @@ Eval: 2.9% (0) -> 43.9 (10) -> 55.8 (20) -> 63.4 (30) -> 69.5 (40) -> 72.3 (50) 
   accuracy, but a less stable phase around steps 20-35 that can be fatal (1 of 2 seeds).
 - Rollout logging works: 24,320 rows (95 steps x 256), 33 MB.
 
+### grpo_no_baseline (2026-10-01): raw 0/1 rewards as weights -> ~45%, answers collapse to ~40 tokens
+Eval: 3.1% (0) -> 27.7 (10) -> 40.7 (20) -> 48.2 (30) -> 48.1 (40) -> 45.3 (50) -> 42.7 (60) -> 44.5 (70) -> 44.6 (80)
+-> 45.3 (90) -> 52.1 (100) -> 45.4 (110). Base at the same steps: 50.3, 58.1, 64.9, 68.1, 70.1, 69.6, 71.2, 72.6, 72.2,
+72.7. Plots: `outputs/grpo/baseline_ablation_{eval_reward,metrics}.png`.
+
+| steps | run | train reward | format | length correct / wrong | token entropy | grad norm | loss |
+|---|---|---|---|---|---|---|---|
+| 6-20 | base | 0.70 | 0.93 | 110 / 152 | 0.15 | 3.0 | -0.05 |
+| 6-20 | no_baseline | 0.48 | 0.91 | 102 / 111 | 0.54 | 0.32 | +0.19 |
+| 21-50 | base | 0.76 | 0.98 | 117 / 171 | 0.16 | 12.4 | -0.31 |
+| 21-50 | no_baseline | 0.65 | 0.98 | 98 / 99 | 0.42 | 0.37 | +0.24 |
+| 81-110 | base | 0.81 | 0.95 | 109 / 155 | 0.05 | 48.7 | -3.69 |
+| 81-110 | no_baseline | 0.54 | 0.99 | **39 / 47** | 0.21 | 0.79 | +0.10 |
+
+- **~27 points worse than with the baseline** (45% vs 72.7%), and it's not just slower: accuracy peaks ~48% at step
+  30-40, then drifts down while train reward falls 0.65 -> 0.54.
+- **Format is learned equally well** (99%); what fails is correctness: 704 well-formatted wrong answers at step 110.
+- **The model stops reasoning.** Response length 120 -> ~40 tokens. Step-110 samples:
+  `16-3-4=9</think> <answer>18</answer>`, ` 2+1=3</think> <answer>3</answer>`. Terse one-line arithmetic, right on easy
+  questions and wrong on anything needing more steps.
+- **Why (mechanism):** with no baseline the loss weight is the raw reward: +1 for every correct answer, 0 for every
+  wrong one. So (a) nothing is ever pushed down: a terse wrong guess costs nothing; (b) the gradient is "imitate your
+  own correct samples", dominated by easy questions (all 8 correct -> 8 positive samples, hard questions -> few or
+  none); (c) with masked_mean each token's weight is 1/len, so short correct answers get more gradient per token, and
+  with only positive weights there is no opposing term -> drift toward ever-shorter answers. With a baseline, an
+  all-correct group gets advantage 0 (no update) and wrong answers get negative advantage, which removes (a)-(c).
+- **Update size differs too (a confound):** pre-clip grad norm is 0.15-0.8 here (< 1, so *not* clipped -> smaller
+  steps) vs 3-50 for base (always clipped to 1). Part of the early gap (27.7% vs 50.3% at step 10) may be step size;
+  the later decline is not.
+- **Prediction check:** I expected faster entropy collapse; wrong. Entropy stays *higher* (0.21 vs 0.05 at the end),
+  consistent with the smaller, positive-only updates. "zero-std groups" is not meaningful for this loss (all-correct
+  groups still produce gradient).
+- **Interview version:** the baseline is not only variance reduction in theory; with 0/1 rewards it is what turns
+  "wrong" into a negative signal and "everyone was right" into no signal. Without it you get reward-weighted
+  self-imitation, which here drifts to short, lazy answers.
+
+### grpo_question_only (2026-10-01): bare-question prompt -> 58% zero-shot, 84% after 70 steps
+Prompt = just the question; reward = `question_only_reward_fn` (needs a `\\boxed{}` answer); no stop string (ends at
+EOS or 1024 tokens); same prompt and reward for train and eval. Plots: `outputs/grpo/prompt_ablation_{eval_reward,metrics}.png`.
+
+| eval step | 0 | 10 | 20 | 30 | 40 | 50 | 60 | 70 |
+|---|---|---|---|---|---|---|---|---|
+| question_only (job 22601289) | 58.0 | 73.2 | 80.6 | 82.8 | 83.2 | 83.2 | 84.3 | 84.2 |
+| question_only rerun (same seed) | 58.0 | 77.4 | 80.6 | 80.5 | 81.0 | 81.9 | 82.0 | 83.9 |
+| r1_zero prompt (grpo_base) | 3.1 | 50.3 | 58.1 | 64.9 | 68.1 | 70.1 | 69.6 | 71.2 |
+
+- **The prompt is worth more than all the training we did with r1_zero.** The *untrained* model scores 58% with the
+  bare question vs 3% with the r1_zero prompt, and after 70 GRPO steps 84% vs 71%. With r1_zero most of the RL budget
+  goes into learning an unfamiliar output format; with the bare question the model is already in its pretraining
+  format (step-0 format reward 0.89: it writes `\\boxed{}` on its own).
+- **What the model does natively:** long step-by-step text (~350-400 tokens vs ~120 with r1_zero), often followed by
+  Python code and a *hallucinated* ```` ```output ```` block (nothing is executed), then `\\boxed{answer}`. This is
+  Qwen2.5-Math's tool-integrated-reasoning style from pretraining. Wrong answers often "confirm" a wrong number via
+  the fake output.
+- **RL barely moves the policy, yet accuracy rises 26 points.** Pre-clip grad norm is 0.06-0.16 (never clipped, tiny
+  updates), entropy starts low (0.22) and drifts to 0.09, length stays ~380. Gains come from fixing errors (boxed
+  but wrong: 408 -> 201 on the 1319 test problems; no `\\boxed`: 144 -> 11), not from a change of style.
+- **Train-test gap suggests GSM8K train was in the model's pretraining data.** Train rollout reward is 0.70 at
+  steps 1-5 (before any real learning) vs 0.58 on test at step 0; at the end 0.93 vs 0.84. It cannot be RL
+  overfitting: 74 steps x 32 questions = 2,368 < 7,473, so no training question was seen twice. The r1_zero run shows
+  the same gap (0.82 train vs 0.72 test). Caveat: 160 train questions at steps 1-5, so +-4 pts.
+- **Saturation:** by steps 51-74, ~80% of groups are all-correct (zero std) -> little gradient left on GSM8K train.
+- **Same-seed repeat (accidental):** the two runs differ by up to 4 pts at a given eval step (77.4 vs 73.2 at step
+  10, 80.5 vs 82.8 at step 30) and 0.3 pts at step 70. The seed does not make runs deterministic (vLLM sampling);
+  +-2-3 pts is the run-to-run noise to keep in mind for every comparison in this file.
+- **Cost:** steps ~35 s (rollout 11 s + train 24 s) and evals ~75 s (long answers), so only ~74 steps fit in the hour.
+  No OOM.
+- **Interview version:** RL results are only meaningful relative to the prompt/format the base model was pretrained
+  on. A big "RL gain" can be mostly format learning (r1_zero: 3% -> 72%), and the same model with its native prompt
+  starts at 58%. Always report the zero-shot number for the prompt you train with.
+
+**Process error (mine):** two auto-submit scripts were alive at once (the first had not died as I assumed), so
+`grpo_question_only` was submitted twice and both jobs wrote into the same run folder (~2 GPU-h wasted). Files were
+split on 2026-10-02 into `grpo_question_only/` and `grpo_question_only_rerun/` (`*.mixed_backup` kept; the first
+run's per-step `eval/step_*.jsonl` were overwritten and are lost). Before starting a submitter, check
+`ps -u $USER -o pid,args | grep "[s]ubmit_grpo"`, and never reuse a run name.
+
 ### Entropy collapse: why, is it a problem, fixes (discussion, 2026-09-30)
 - **Why.** For softmax policies, the entropy change per update is ~ -Cov(log pi(token), advantage) (Cui et al. 2025,
   "The Entropy Mechanism of RL for Reasoning LMs"). Likely tokens are more often correct -> positive covariance ->
@@ -237,3 +318,5 @@ Legend: [x] done, [~] skipped by choice, [-] not planned.
 - [x] grpo_no_std_seed1 (job 22584780), `--seed 1` + rollout logging -> stable, 75.3% at step 90; near-miss at steps ~21-35.
   takeaway 5: advantages become r - mean(r) in [-1, 1] (no 1/std blow-up for 7/8 or 1/8 groups), so the pre-clip
   grad norm should grow much less; effect on accuracy unclear (Dr. GRPO reports similar or better).
+- [x] grpo_no_baseline (job 22597253) -> 45.4% at step 110 (best 52.1%), vs 72.7% for base. See notes.
+- [x] grpo_question_only (job 22601289) -> 84.2% at step 70 (zero-shot 58.0%); duplicate rerun 22607113 -> 83.9%. See notes.
